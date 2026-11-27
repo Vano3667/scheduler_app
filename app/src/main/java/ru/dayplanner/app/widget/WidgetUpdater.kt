@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.StrikethroughSpan
+import android.util.Log
 import android.widget.RemoteViews
 import android.widget.RemoteViewsService
 import androidx.activity.ComponentActivity
@@ -47,8 +48,19 @@ object WidgetUpdater {
     const val ACTION_ADD = "add"
     const val ACTION_ROW = "row"
 
+    /** Номера запросов PendingIntent для экрана дня; не должны совпадать с другими в приложении. */
+    private const val REQUEST_OPEN_TODAY = 4101
+
     fun requestUpdate(context: Context) {
-        val c = context.applicationContext
+        try {
+            update(context.applicationContext)
+        } catch (e: RuntimeException) {
+            // Сбой виджета не должен мешать работе самого приложения.
+            Log.w("Planner", "Не удалось обновить виджет", e)
+        }
+    }
+
+    private fun update(c: Context) {
         val manager = AppWidgetManager.getInstance(c)
         val ids = manager.getAppWidgetIds(ComponentName(c, PlannerWidget::class.java))
         val alarms = c.getSystemService(AlarmManager::class.java)
@@ -72,6 +84,12 @@ object WidgetUpdater {
             alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, midnight, tick)
         }
 
+        val openToday = PendingIntent.getActivity(
+            c,
+            REQUEST_OPEN_TODAY,
+            todayIntent(c),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         for (id in ids) {
             val views = RemoteViews(c.packageName, R.layout.widget)
             views.setTextViewText(R.id.header, Fmt.fullDate(today.toEpochDay()))
@@ -79,7 +97,7 @@ object WidgetUpdater {
                 .setData(Uri.parse("planner-widget://local/list/$id"))
             views.setRemoteAdapter(R.id.rows, adapter)
             views.setEmptyView(R.id.rows, R.id.empty)
-            views.setOnClickPendingIntent(R.id.header, entry(c, id, ACTION_TODAY, false))
+            views.setOnClickPendingIntent(R.id.header, openToday)
             views.setOnClickPendingIntent(R.id.add, entry(c, id, ACTION_ADD, false))
             views.setPendingIntentTemplate(R.id.rows, entry(c, id, ACTION_ROW, true))
             manager.updateAppWidget(id, views)
@@ -87,8 +105,23 @@ object WidgetUpdater {
         manager.notifyAppWidgetViewDataChanged(ids, R.id.rows)
     }
 
+    /**
+     * Экран дня на сегодня. Задача приложения пересоздаётся, поэтому открывается именно
+     * сегодняшний день, а не тот, что был открыт раньше. Действие и категория совпадают
+     * с запуском по значку, чтобы значок потом не создавал второй экземпляр экрана.
+     */
+    fun todayIntent(c: Context): Intent =
+        Intent(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LAUNCHER)
+            .setClass(c, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+
     private fun entry(c: Context, widgetId: Int, action: String, mutable: Boolean): PendingIntent {
-        val intent = Intent(c, WidgetEntryActivity::class.java).setAction(action)
+        // CLEAR_TASK обязателен: без него повторное нажатие на другую строку лишь подняло бы
+        // прежнее окно с прежним делом (дополнительные данные намерения при этом не учитываются).
+        val intent = Intent(c, WidgetEntryActivity::class.java)
+            .setAction(action)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         val mutability = when {
             !mutable -> PendingIntent.FLAG_IMMUTABLE
             Build.VERSION.SDK_INT >= 31 -> PendingIntent.FLAG_MUTABLE
@@ -168,7 +201,7 @@ private class Rows(private val c: Context) : RemoteViewsService.RemoteViewsFacto
     override fun hasStableIds(): Boolean = true
 }
 
-/** Точка входа из виджета: страница дела, добавление дела на сегодня или экран дня. */
+/** Точка входа из виджета: страница дела или добавление дела на сегодня. */
 class WidgetEntryActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -177,7 +210,7 @@ class WidgetEntryActivity : ComponentActivity() {
         val day = intent.getLongExtra("day", LocalDate.now().toEpochDay())
         val openDay = action == WidgetUpdater.ACTION_TODAY || (action == WidgetUpdater.ACTION_ROW && id <= 0)
         if (openDay) {
-            startActivity(Intent(this, MainActivity::class.java))
+            startActivity(WidgetUpdater.todayIntent(this))
             finish()
             return
         }
