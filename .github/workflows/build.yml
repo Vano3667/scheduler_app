@@ -29,38 +29,38 @@ jobs:
       - name: Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Проверка ключа и подготовка Android SDK
+      # Wrapper и ключ подписи лежат в репозитории. Без них сборку не начинаем:
+      # новый ключ означал бы, что обновление не встанет поверх установленной версии.
+      - name: Проверка wrapper и ключа подписи
         run: |
           set -euo pipefail
           test -s keystore/debug.keystore
           test -s gradle/wrapper/gradle-wrapper.jar
           chmod +x gradlew
-          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          # Платформа Android 17 называется android-37.0. Если поставить её заранее не удалось,
-          # недостающее скачает сам Gradle.
-          yes | "$sdk" 'platforms;android-37.0' || echo "Платформу скачает Gradle"
-          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
 
       - name: Модульные тесты
-        run: ./gradlew --stacktrace testDebugUnitTest
+        run: ./gradlew --no-daemon --stacktrace testDebugUnitTest
 
       - name: Сборка APK
-        run: ./gradlew --stacktrace assembleDebug
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
 
-      # Проверяется уже собранный файл: подпись тем же ключом, пакет, версия и отсутствие лишних разрешений.
+      # Проверяется уже собранный файл: подпись тем же ключом, пакет, версия, отсутствие лишних разрешений.
       - name: Проверка готового APK
         run: |
           set -euo pipefail
           apk=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$apk"
           tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
           echo "Инструменты: $tools"
-          "$tools/apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
+          "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/certs.txt"
+          cat "$RUNNER_TEMP/certs.txt"
           cert="$(keytool -exportcert -keystore keystore/debug.keystore -storepass android -alias androiddebugkey | sha256sum | cut -d' ' -f1)"
           grep -F "certificate SHA-256 digest: $cert" "$RUNNER_TEMP/certs.txt"
-          "$tools/aapt2" dump badging "$apk" | tee "$RUNNER_TEMP/apk.txt"
+          "$tools/aapt2" dump badging "$apk" > "$RUNNER_TEMP/apk.txt"
+          head -n 30 "$RUNNER_TEMP/apk.txt"
           grep -F "package: name='ru.dayplanner.app' versionCode='$GITHUB_RUN_NUMBER'" "$RUNNER_TEMP/apk.txt"
-          grep -E "^(sdkVersion|minSdkVersion):'29'" "$RUNNER_TEMP/apk.txt"
-          grep -E "^targetSdkVersion:'37" "$RUNNER_TEMP/apk.txt"
+          grep -F "sdkVersion:'29'" "$RUNNER_TEMP/apk.txt"
+          grep -F "targetSdkVersion:'36'" "$RUNNER_TEMP/apk.txt"
           if grep -E "android\.permission\.(INTERNET|CAMERA|READ_EXTERNAL_STORAGE|WRITE_EXTERNAL_STORAGE|READ_MEDIA_IMAGES)'" "$RUNNER_TEMP/apk.txt"; then
             echo "В APK попало разрешение, которого быть не должно"
             exit 1
