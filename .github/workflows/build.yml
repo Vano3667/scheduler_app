@@ -57,10 +57,11 @@ jobs:
           cert="$(keytool -exportcert -keystore keystore/debug.keystore -storepass android -alias androiddebugkey | sha256sum | cut -d' ' -f1)"
           grep -F "certificate SHA-256 digest: $cert" "$RUNNER_TEMP/certs.txt"
           "$tools/aapt2" dump badging "$apk" > "$RUNNER_TEMP/apk.txt"
-          head -n 30 "$RUNNER_TEMP/apk.txt"
+          head -n 14 "$RUNNER_TEMP/apk.txt"
           grep -F "package: name='ru.dayplanner.app' versionCode='$GITHUB_RUN_NUMBER'" "$RUNNER_TEMP/apk.txt"
-          grep -F "sdkVersion:'29'" "$RUNNER_TEMP/apk.txt"
-          grep -F "targetSdkVersion:'36'" "$RUNNER_TEMP/apk.txt"
+          # Разные версии aapt2 пишут минимальную версию как sdkVersion или minSdkVersion.
+          grep -E "^(sdkVersion|minSdkVersion):'29'" "$RUNNER_TEMP/apk.txt"
+          grep -E "^targetSdkVersion:'36'" "$RUNNER_TEMP/apk.txt"
           if grep -E "android\.permission\.(INTERNET|CAMERA|READ_EXTERNAL_STORAGE|WRITE_EXTERNAL_STORAGE|READ_MEDIA_IMAGES)'" "$RUNNER_TEMP/apk.txt"; then
             echo "В APK попало разрешение, которого быть не должно"
             exit 1
