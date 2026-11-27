@@ -137,8 +137,13 @@ object Signals {
         nm.notify("${t.id}:${k.name}", 1, notification)
     }
 
+    /**
+     * Можно ли запустить звонящий сервис. Разрешение на полноэкранное окно для этого не нужно:
+     * без него система покажет то же уведомление с кнопкой «Выключить» вместо окна, а звук
+     * всё равно играет до нажатия. Сервис разрешено запускать только из точного срабатывания.
+     */
     private fun canRing(c: Context, nm: NotificationManager): Boolean {
-        if (!full(c) || !SignalScheduler.exact(c)) return false
+        if (!SignalScheduler.exact(c)) return false
         val channel = nm.getNotificationChannel(CHANNEL_RING) ?: return false
         return channel.importance >= NotificationManager.IMPORTANCE_HIGH
     }

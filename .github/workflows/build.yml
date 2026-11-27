@@ -17,38 +17,55 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Получение исходников
+        uses: actions/checkout@v4
+
       - name: JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Подготовка Android SDK и проверка ключа
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Проверка ключа и подготовка Android SDK
         run: |
           set -euo pipefail
           test -s keystore/debug.keystore
           test -s gradle/wrapper/gradle-wrapper.jar
           chmod +x gradlew
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-37' 'build-tools;36.0.0'
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # Платформа Android 17 называется android-37.0. Если поставить её заранее не удалось,
+          # недостающее скачает сам Gradle.
+          yes | "$sdk" 'platforms;android-37.0' || echo "Платформу скачает Gradle"
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
       - name: Модульные тесты
         run: ./gradlew --stacktrace testDebugUnitTest
+
       - name: Сборка APK
         run: ./gradlew --stacktrace assembleDebug
-      - name: Проверка подписи, пакета, версии и разрешений готового APK
+
+      # Проверяется уже собранный файл: подпись тем же ключом, пакет, версия и отсутствие лишних разрешений.
+      - name: Проверка готового APK
         run: |
           set -euo pipefail
           apk=app/build/outputs/apk/debug/app-debug.apk
-          tools="$ANDROID_HOME/build-tools/36.0.0"
-          "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/certs.txt"
-          cert=$(keytool -exportcert -keystore keystore/debug.keystore -storepass android -alias androiddebugkey | sha256sum | cut -d' ' -f1)
+          tools="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          echo "Инструменты: $tools"
+          "$tools/apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
+          cert="$(keytool -exportcert -keystore keystore/debug.keystore -storepass android -alias androiddebugkey | sha256sum | cut -d' ' -f1)"
           grep -F "certificate SHA-256 digest: $cert" "$RUNNER_TEMP/certs.txt"
-          "$tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/apk.txt"
+          "$tools/aapt2" dump badging "$apk" | tee "$RUNNER_TEMP/apk.txt"
           grep -F "package: name='ru.dayplanner.app' versionCode='$GITHUB_RUN_NUMBER'" "$RUNNER_TEMP/apk.txt"
-          grep -Fx "sdkVersion:'29'" "$RUNNER_TEMP/apk.txt"
-          grep -Fx "targetSdkVersion:'37'" "$RUNNER_TEMP/apk.txt"
-          "$tools/aapt" dump permissions "$apk" > "$RUNNER_TEMP/permissions.txt"
-          if grep -Eq "android\.permission\.(INTERNET|CAMERA|READ_EXTERNAL_STORAGE|WRITE_EXTERNAL_STORAGE|READ_MEDIA_IMAGES)'" "$RUNNER_TEMP/permissions.txt"; then exit 1; fi
+          grep -E "^(sdkVersion|minSdkVersion):'29'" "$RUNNER_TEMP/apk.txt"
+          grep -E "^targetSdkVersion:'37" "$RUNNER_TEMP/apk.txt"
+          if grep -E "android\.permission\.(INTERNET|CAMERA|READ_EXTERNAL_STORAGE|WRITE_EXTERNAL_STORAGE|READ_MEDIA_IMAGES)'" "$RUNNER_TEMP/apk.txt"; then
+            echo "В APK попало разрешение, которого быть не должно"
+            exit 1
+          fi
+
       - name: Выкладка APK
         uses: actions/upload-artifact@v4
         with:
