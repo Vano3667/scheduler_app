@@ -8,49 +8,314 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import ru.dayplanner.app.container
-import ru.dayplanner.app.domain.*
-import java.io.*
+import ru.dayplanner.app.domain.Completion
+import ru.dayplanner.app.domain.Photo
+import ru.dayplanner.app.domain.RepeatMode
+import ru.dayplanner.app.domain.SignalType
+import ru.dayplanner.app.domain.SkippedDay
+import ru.dayplanner.app.domain.Task
+import ru.dayplanner.app.domain.Template
+import ru.dayplanner.app.domain.TimeMode
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.UUID
-import java.util.zip.*
+import java.util.zip.CRC32
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
-/** Архив не содержит SQL, сериализованных объектов JVM или путей, используемых при записи на диск. */
+/**
+ * Резервная копия: один ZIP-файл с описанием данных (JSON) и фотографиями.
+ *
+ * Импорт сначала полностью читает и проверяет файл, и только потом одной транзакцией
+ * заменяет данные. Повреждённый или чужой файл текущие данные не трогает.
+ * В архиве нет SQL, сериализованных объектов и путей, которые использовались бы при записи на диск.
+ */
 object Backup {
-    private const val META="planner-v1.json"
-    private const val META_LIMIT=16L*1024*1024
-    private const val TOTAL=1024L*1024*1024
-    private const val FILE_LIMIT=128L*1024*1024
-    private const val MAX_ENTRIES=10000
-    private const val MAX_ROWS=100000
-    private fun row(vararg values:Any?):JSONArray=JSONArray().apply { values.forEach { put(it ?: JSONObject.NULL) } }
-    private fun <T> rows(list:List<T>, f:(T)->JSONArray)=JSONArray().apply { require(list.size<=MAX_ROWS);list.forEach { put(f(it)) } }
-    private fun <T> decode(obj:JSONObject,key:String,n:Int,f:(JSONArray)->T):List<T>{val a=obj.getJSONArray(key);require(a.length()<=MAX_ROWS);return List(a.length()){f(a.getJSONArray(it).also { r->require(r.length()==n) })}}
-    private fun name(i:Int)="photos/$i"
-    private fun copy(input:InputStream,out:OutputStream,limit:Long,expectedCrc:Long?=null):Long { val buf=ByteArray(32768);val crc=CRC32();var count=0L;while(true){val n=input.read(buf);if(n<0)break;count+=n;require(count<=limit);out.write(buf,0,n);if(expectedCrc!=null)crc.update(buf,0,n)};require(expectedCrc==null||crc.value==expectedCrc);return count }
+    private const val FORMAT = "ru.dayplanner.app/1"
+    private const val META = "planner-v1.json"
+    private const val META_LIMIT = 16L * 1024 * 1024
+    private const val TOTAL_LIMIT = 1024L * 1024 * 1024
+    private const val FILE_LIMIT = 128L * 1024 * 1024
+    private const val MAX_ENTRIES = 10_000
+    private const val MAX_ROWS = 100_000
+    private const val MAX_DAY = 79_999L
 
-    suspend fun export(c:Context,uri:Uri)=withContext(Dispatchers.IO){val box=c.container;val dao=box.db.dao();val tmp=File.createTempFile("export-",".zip",c.cacheDir)
-        try { box.db.withTransaction { val photos=dao.getAllPhotos();val names=photos.map { it.fileName }.distinct();require(names.size<MAX_ENTRIES);val ids=names.withIndex().associate{it.value to it.index};val obj=JSONObject().put("format","ru.dayplanner.app/1").put("images",names.size)
-            obj.put("tasks",rows(dao.getTasks()){t->row(t.id,t.title,t.description,t.timeMode.name,t.startMinutes,t.endMinutes,t.startDay,t.endDay,t.repeatMode.name,t.weekdaysMask,t.signalStart,t.signalEnd,t.signalType.name,t.createdAt)})
-            obj.put("templates",rows(dao.getTemplates()){t->row(t.id,t.title,t.description,t.signalStart,t.signalEnd,t.signalType.name)})
-            obj.put("photos",rows(photos){p->row(p.taskId,ids.getValue(p.fileName),p.position)})
-            obj.put("done",rows(dao.getCompletions()){row(it.taskId,it.day)});obj.put("skip",rows(dao.getSkipped()){row(it.taskId,it.day)})
-            val bytes=obj.toString().toByteArray(Charsets.UTF_8);require(bytes.size<=META_LIMIT);var left=TOTAL-bytes.size
-            ZipOutputStream(tmp.outputStream().buffered()).use { z->z.putNextEntry(ZipEntry(META));z.write(bytes);z.closeEntry();names.forEachIndexed { i,n->z.putNextEntry(ZipEntry(name(i)));val size=box.photoStore.file(n).inputStream().use{copy(it,z,minOf(left,FILE_LIMIT))};require(size>0);left-=size;z.closeEntry() } }
-        };require(tmp.length()<=TOTAL);requireNotNull(c.contentResolver.openOutputStream(uri,"wt")).use { out->tmp.inputStream().use{it.copyTo(out)} };Unit } finally {tmp.delete()}
+    private class Snapshot(
+        val tasks: List<Task>,
+        val templates: List<Template>,
+        val photos: List<Photo>,
+        val done: List<Completion>,
+        val skipped: List<SkippedDay>,
+    )
+
+    private fun row(vararg values: Any?): JSONArray {
+        val array = JSONArray()
+        for (value in values) {
+            val item: Any = value ?: JSONObject.NULL
+            array.put(item)
+        }
+        return array
     }
 
-    suspend fun restore(c:Context,uri:Uri)=withContext(Dispatchers.IO){val box=c.container;val dao=box.db.dao();val tmp=File.createTempFile("import-",".zip",c.cacheDir);val staged=mutableListOf<File>();var committed=false
-        try { requireNotNull(c.contentResolver.openInputStream(uri)).use{input->tmp.outputStream().use {copy(input,it,TOTAL)}}
-            ZipFile(tmp).use { z->require(z.size() in 1..MAX_ENTRIES);val meta=requireNotNull(z.getEntry(META));require(meta.size in 1..META_LIMIT)
-                val bytes=ByteArrayOutputStream();z.getInputStream(meta).use { require(copy(it,bytes,META_LIMIT,meta.crc)==meta.size) };val obj=JSONObject(bytes.toString("UTF-8"));require(obj.getString("format")=="ru.dayplanner.app/1");val n=obj.getInt("images");require(n in 0 until MAX_ENTRIES && z.size()==n+1)
-                fun date(x:Long)=x.also{require(it in 0L..79999L)}
-                val tasks=decode(obj,"tasks",14){r->Task(r.getLong(0),r.getString(1),r.getString(2),TimeMode.valueOf(r.getString(3)),r.getInt(4),r.getInt(5),date(r.getLong(6)),if(r.isNull(7))null else date(r.getLong(7)),RepeatMode.valueOf(r.getString(8)),r.getInt(9),r.getBoolean(10),r.getBoolean(11),SignalType.valueOf(r.getString(12)),r.getLong(13)).also { t->require(t.id>0&&t.title.isNotBlank()&&t.startMinutes in 0..1439&&t.endMinutes in 0..1439&&(t.timeMode!=TimeMode.RANGE||t.endMinutes>t.startMinutes)&&(t.endDay==null||t.endDay>=t.startDay)&&(t.repeatMode!=RepeatMode.WEEKDAYS||t.weekdaysMask in 1..127)) }}
-                val taskIds=tasks.map {it.id}.toSet();require(taskIds.size==tasks.size);val templates=decode(obj,"templates",6){r->Template(r.getLong(0),r.getString(1),r.getString(2),r.getBoolean(3),r.getBoolean(4),SignalType.valueOf(r.getString(5))).also{require(it.id>0&&it.title.isNotBlank())}};require(templates.distinctBy {it.id}.size==templates.size)
-                val done=decode(obj,"done",2){r->Completion(r.getLong(0),date(r.getLong(1))).also{require(it.taskId in taskIds)}};val skip=decode(obj,"skip",2){r->SkippedDay(r.getLong(0),date(r.getLong(1))).also{require(it.taskId in taskIds)}};require(done.distinct().size==done.size&&skip.distinct().size==skip.size)
-                val refs=decode(obj,"photos",3){r->Triple(r.getLong(0),r.getInt(1),r.getInt(2)).also{require(it.first in taskIds&&it.second in 0 until n&&it.third>=0)}};require(refs.map{it.second}.toSet().size==n);require(refs.distinctBy{it.first to it.second}.size==refs.size)
-                var left=TOTAL-meta.size
-                for(index in 0 until n){ val entry=requireNotNull(z.getEntry(name(index)));require(entry.size in 1..minOf(left,FILE_LIMIT));val f=File(box.photoStore.dir,"p_${UUID.randomUUID()}.jpg");require(f.createNewFile());staged+=f;z.getInputStream(entry).use { input->f.outputStream().use { out->require(copy(input,out,entry.size,entry.crc)==entry.size) } };left-=entry.size }
-                val photos=refs.map{ Photo(taskId=it.first,fileName=staged[it.second].name,position=it.third) };val old=box.db.withTransaction { val names=dao.getAllPhotos().map{it.fileName}.distinct();dao.deleteAllTasks();dao.deleteAllTemplates();dao.insertTasks(tasks);dao.insertTemplates(templates);dao.insertCompletions(done);dao.insertSkippedList(skip);dao.insertPhotos(photos);names };committed=true;box.notifyChanged();old.forEach{box.photoStore.delete(it)}
-            };Unit
-        } finally { if(!committed) staged.forEach{it.delete()};tmp.delete() }
+    private fun <T> rows(items: List<T>, encode: (T) -> JSONArray): JSONArray {
+        require(items.size <= MAX_ROWS)
+        val array = JSONArray()
+        for (item in items) {
+            val encoded: Any = encode(item)
+            array.put(encoded)
+        }
+        return array
+    }
+
+    private fun <T> decode(source: JSONObject, key: String, width: Int, parse: (JSONArray) -> T): List<T> {
+        val array = source.getJSONArray(key)
+        require(array.length() <= MAX_ROWS)
+        return List(array.length()) { index ->
+            val row = array.getJSONArray(index)
+            require(row.length() == width)
+            parse(row)
+        }
+    }
+
+    private fun entryName(index: Int): String = "photos/$index"
+
+    private fun day(value: Long): Long {
+        require(value in 0L..MAX_DAY)
+        return value
+    }
+
+    /** Копирует поток с ограничением размера; при [expectedCrc] проверяет контрольную сумму. */
+    private fun copy(input: InputStream, output: OutputStream, limit: Long, expectedCrc: Long? = null): Long {
+        val buffer = ByteArray(32 * 1024)
+        val crc = CRC32()
+        var total = 0L
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            total += read
+            require(total <= limit)
+            output.write(buffer, 0, read)
+            crc.update(buffer, 0, read)
+        }
+        require(expectedCrc == null || crc.value == expectedCrc)
+        return total
+    }
+
+    suspend fun export(context: Context, uri: Uri) {
+        withContext(Dispatchers.IO) {
+            val box = context.container
+            val dao = box.db.dao()
+            val tmp = File.createTempFile("export-", ".zip", context.cacheDir)
+            try {
+                val snapshot = box.db.withTransaction {
+                    Snapshot(
+                        tasks = dao.getTasks(),
+                        templates = dao.getTemplates(),
+                        photos = dao.getAllPhotos(),
+                        done = dao.getCompletions(),
+                        skipped = dao.getSkipped(),
+                    )
+                }
+                // В копию попадают только фото, файлы которых действительно есть на диске.
+                val names = snapshot.photos.map { it.fileName }.distinct().filter { name ->
+                    val file = box.photoStore.file(name)
+                    file.isFile && file.length() in 1..FILE_LIMIT
+                }
+                require(names.size < MAX_ENTRIES)
+                val indexOf = HashMap<String, Int>()
+                names.forEachIndexed { index, name -> indexOf[name] = index }
+                val photoRefs = snapshot.photos.filter { indexOf.containsKey(it.fileName) }
+
+                val meta = JSONObject()
+                meta.put("format", FORMAT)
+                meta.put("images", names.size)
+                meta.put(
+                    "tasks",
+                    rows(snapshot.tasks) { t ->
+                        row(
+                            t.id, t.title, t.description, t.timeMode.name, t.startMinutes, t.endMinutes,
+                            t.startDay, t.endDay, t.repeatMode.name, t.weekdaysMask,
+                            t.signalStart, t.signalEnd, t.signalType.name, t.createdAt,
+                        )
+                    },
+                )
+                meta.put(
+                    "templates",
+                    rows(snapshot.templates) { t ->
+                        row(t.id, t.title, t.description, t.signalStart, t.signalEnd, t.signalType.name)
+                    },
+                )
+                meta.put(
+                    "photos",
+                    rows(photoRefs) { p -> row(p.taskId, indexOf.getValue(p.fileName), p.position) },
+                )
+                meta.put("done", rows(snapshot.done) { row(it.taskId, it.day) })
+                meta.put("skip", rows(snapshot.skipped) { row(it.taskId, it.day) })
+
+                val metaBytes = meta.toString().toByteArray(Charsets.UTF_8)
+                require(metaBytes.size <= META_LIMIT)
+                var left = TOTAL_LIMIT - metaBytes.size
+                ZipOutputStream(tmp.outputStream().buffered()).use { zip ->
+                    zip.putNextEntry(ZipEntry(META))
+                    zip.write(metaBytes)
+                    zip.closeEntry()
+                    names.forEachIndexed { index, name ->
+                        zip.putNextEntry(ZipEntry(entryName(index)))
+                        val size = box.photoStore.file(name).inputStream().use { input ->
+                            copy(input, zip, minOf(left, FILE_LIMIT))
+                        }
+                        require(size > 0)
+                        left -= size
+                        zip.closeEntry()
+                    }
+                }
+                require(tmp.length() <= TOTAL_LIMIT)
+
+                val target = requireNotNull(context.contentResolver.openOutputStream(uri, "wt"))
+                target.use { out -> tmp.inputStream().use { input -> input.copyTo(out) } }
+            } finally {
+                tmp.delete()
+            }
+        }
+    }
+
+    suspend fun restore(context: Context, uri: Uri) {
+        withContext(Dispatchers.IO) {
+            val box = context.container
+            val dao = box.db.dao()
+            val tmp = File.createTempFile("import-", ".zip", context.cacheDir)
+            val staged = ArrayList<File>()
+            var committed = false
+            try {
+                val source = requireNotNull(context.contentResolver.openInputStream(uri))
+                source.use { input -> tmp.outputStream().use { out -> copy(input, out, TOTAL_LIMIT) } }
+
+                ZipFile(tmp).use { zip ->
+                    require(zip.size() in 1..MAX_ENTRIES)
+                    val metaEntry = requireNotNull(zip.getEntry(META))
+                    require(metaEntry.size in 1..META_LIMIT)
+                    val metaBytes = ByteArrayOutputStream()
+                    zip.getInputStream(metaEntry).use { input ->
+                        require(copy(input, metaBytes, META_LIMIT, metaEntry.crc) == metaEntry.size)
+                    }
+                    val meta = JSONObject(metaBytes.toString("UTF-8"))
+                    require(meta.getString("format") == FORMAT)
+                    val imageCount = meta.getInt("images")
+                    require(imageCount in 0 until MAX_ENTRIES)
+                    require(zip.size() == imageCount + 1)
+
+                    // --- Разбор и проверка описания ---
+                    val tasks = decode(meta, "tasks", 14) { r ->
+                        val task = Task(
+                            id = r.getLong(0),
+                            title = r.getString(1),
+                            description = r.getString(2),
+                            timeMode = TimeMode.valueOf(r.getString(3)),
+                            startMinutes = r.getInt(4),
+                            endMinutes = r.getInt(5),
+                            startDay = day(r.getLong(6)),
+                            endDay = if (r.isNull(7)) null else day(r.getLong(7)),
+                            repeatMode = RepeatMode.valueOf(r.getString(8)),
+                            weekdaysMask = r.getInt(9),
+                            signalStart = r.getBoolean(10),
+                            signalEnd = r.getBoolean(11),
+                            signalType = SignalType.valueOf(r.getString(12)),
+                            createdAt = r.getLong(13),
+                        )
+                        val endDay = task.endDay
+                        require(task.id > 0 && task.title.isNotBlank())
+                        require(task.startMinutes in 0..1439 && task.endMinutes in 0..1439)
+                        require(task.timeMode != TimeMode.RANGE || task.endMinutes > task.startMinutes)
+                        require(endDay == null || endDay >= task.startDay)
+                        require(task.repeatMode != RepeatMode.WEEKDAYS || task.weekdaysMask in 1..127)
+                        task
+                    }
+                    val taskIds = HashSet<Long>()
+                    for (task in tasks) require(taskIds.add(task.id))
+
+                    val templates = decode(meta, "templates", 6) { r ->
+                        val template = Template(
+                            id = r.getLong(0),
+                            title = r.getString(1),
+                            description = r.getString(2),
+                            signalStart = r.getBoolean(3),
+                            signalEnd = r.getBoolean(4),
+                            signalType = SignalType.valueOf(r.getString(5)),
+                        )
+                        require(template.id > 0 && template.title.isNotBlank())
+                        template
+                    }
+                    require(templates.map { it.id }.toSet().size == templates.size)
+
+                    val done = decode(meta, "done", 2) { r ->
+                        val item = Completion(r.getLong(0), day(r.getLong(1)))
+                        require(item.taskId in taskIds)
+                        item
+                    }
+                    require(done.toSet().size == done.size)
+
+                    val skipped = decode(meta, "skip", 2) { r ->
+                        val item = SkippedDay(r.getLong(0), day(r.getLong(1)))
+                        require(item.taskId in taskIds)
+                        item
+                    }
+                    require(skipped.toSet().size == skipped.size)
+
+                    val refs = decode(meta, "photos", 3) { r ->
+                        val ref = Triple(r.getLong(0), r.getInt(1), r.getInt(2))
+                        require(ref.first in taskIds && ref.second in 0 until imageCount && ref.third >= 0)
+                        ref
+                    }
+                    require(refs.map { it.second }.toSet().size == imageCount)
+                    require(refs.map { it.first to it.second }.toSet().size == refs.size)
+
+                    // --- Фото сначала распаковываются рядом с текущими, под новыми именами ---
+                    var left = TOTAL_LIMIT - metaEntry.size
+                    for (index in 0 until imageCount) {
+                        val entry = requireNotNull(zip.getEntry(entryName(index)))
+                        require(entry.size in 1..minOf(left, FILE_LIMIT))
+                        val file = File(box.photoStore.dir, "p_" + UUID.randomUUID().toString() + ".jpg")
+                        require(file.createNewFile())
+                        staged.add(file)
+                        zip.getInputStream(entry).use { input ->
+                            file.outputStream().use { out ->
+                                require(copy(input, out, entry.size, entry.crc) == entry.size)
+                            }
+                        }
+                        left -= entry.size
+                    }
+                    val photos = refs.map { ref ->
+                        Photo(taskId = ref.first, fileName = staged[ref.second].name, position = ref.third)
+                    }
+
+                    // --- Замена данных одной транзакцией ---
+                    val oldFiles = box.db.withTransaction {
+                        val names = dao.getAllPhotos().map { it.fileName }.distinct()
+                        dao.deleteAllPhotos()
+                        dao.deleteAllCompletions()
+                        dao.deleteAllSkipped()
+                        dao.deleteAllTasks()
+                        dao.deleteAllTemplates()
+                        dao.insertTasks(tasks)
+                        dao.insertTemplates(templates)
+                        dao.insertCompletions(done)
+                        dao.insertSkippedList(skipped)
+                        dao.insertPhotos(photos)
+                        names
+                    }
+                    committed = true
+                    for (name in oldFiles) box.photoStore.delete(name)
+                }
+                box.notifyChanged()
+            } finally {
+                if (!committed) {
+                    for (file in staged) file.delete()
+                }
+                tmp.delete()
+            }
+        }
     }
 }

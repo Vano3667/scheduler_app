@@ -1,45 +1,260 @@
 @file:Suppress("DEPRECATION")
+
 package ru.dayplanner.app.widget
 
-import android.app.*
-import android.appwidget.*
-import android.content.*
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.appwidget.AppWidgetManager
+import android.appwidget.AppWidgetProvider
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
-import android.os.*
-import android.text.*
+import android.os.Binder
+import android.os.Build
+import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
 import android.text.style.StrikethroughSpan
-import android.widget.*
+import android.util.Log
+import android.widget.RemoteViews
+import android.widget.RemoteViewsService
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.*
-import androidx.compose.runtime.*
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import ru.dayplanner.app.*
-import ru.dayplanner.app.domain.*
+import ru.dayplanner.app.MainActivity
+import ru.dayplanner.app.R
+import ru.dayplanner.app.container
+import ru.dayplanner.app.domain.Occurrence
+import ru.dayplanner.app.domain.TimeText
 import ru.dayplanner.app.signals.SignalScheduler
 import ru.dayplanner.app.ui.Fmt
 import ru.dayplanner.app.ui.editor.EditorScreen
-import ru.dayplanner.app.ui.task.TaskScreen
 import ru.dayplanner.app.ui.effects.EffectsHost
+import ru.dayplanner.app.ui.task.TaskScreen
 import ru.dayplanner.app.ui.theme.PlannerTheme
-import java.time.*
+import java.time.LocalDate
+import java.time.ZoneId
 
+private const val TAG = "Planner"
+
+/** Обновление виджета «дела на сегодня». Вызывается после любого изменения дел и при смене суток. */
 object WidgetUpdater {
-    private const val MIDNIGHT="ru.dayplanner.app.widget.MIDNIGHT"
-    fun requestUpdate(context:Context){val c=context.applicationContext;val mgr=AppWidgetManager.getInstance(c);val ids=mgr.getAppWidgetIds(ComponentName(c,PlannerWidget::class.java));val am=c.getSystemService(AlarmManager::class.java);val tick=PendingIntent.getBroadcast(c,0,Intent(c,PlannerWidget::class.java).setAction(MIDNIGHT),PendingIntent.FLAG_IMMUTABLE)
-        if(ids.isEmpty()){am.cancel(tick);return};val today=LocalDate.now();val next=today.plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli();try{if(SignalScheduler.exact(c))am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,next,tick) else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,next,tick)}catch(_:SecurityException){am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,next,tick)}
-        for(id in ids){val rv=RemoteViews(c.packageName,R.layout.widget);rv.setTextViewText(R.id.header,Fmt.fullDate(today.toEpochDay()));val adapter=Intent(c,RowsService::class.java).setData(Uri.parse("planner-widget://local/list/$id"));rv.setRemoteAdapter(R.id.rows,adapter);rv.setEmptyView(R.id.rows,R.id.empty)
-            fun entry(action:String,mutable:Boolean=false):PendingIntent{val i=Intent(c,WidgetEntryActivity::class.java).setAction(action);val flag=if(!mutable) PendingIntent.FLAG_IMMUTABLE else if(Build.VERSION.SDK_INT>=31)PendingIntent.FLAG_MUTABLE else 0;return PendingIntent.getActivity(c,id,i,PendingIntent.FLAG_UPDATE_CURRENT or flag)}
-            rv.setOnClickPendingIntent(R.id.header,entry("today"));rv.setOnClickPendingIntent(R.id.add,entry("add"));rv.setPendingIntentTemplate(R.id.rows,entry("row",true));mgr.updateAppWidget(id,rv)
-        };mgr.notifyAppWidgetViewDataChanged(ids,R.id.rows)
+    private const val ACTION_MIDNIGHT = "ru.dayplanner.app.widget.MIDNIGHT"
+
+    fun isTick(intent: Intent): Boolean = intent.action == ACTION_MIDNIGHT
+
+    fun requestUpdate(context: Context) {
+        try {
+            update(context.applicationContext)
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось обновить виджет", e)
+        }
     }
-    fun isTick(i:Intent)=i.action==MIDNIGHT||i.action==Intent.ACTION_DATE_CHANGED
+
+    private fun update(c: Context) {
+        val manager = AppWidgetManager.getInstance(c) ?: return
+        val ids = manager.getAppWidgetIds(ComponentName(c, PlannerWidget::class.java)) ?: return
+        val alarms = c.getSystemService(AlarmManager::class.java)
+        val immutable = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val tick = PendingIntent.getBroadcast(
+            c,
+            0,
+            Intent(c, PlannerWidget::class.java).setAction(ACTION_MIDNIGHT),
+            immutable,
+        )
+        if (ids.isEmpty()) {
+            alarms.cancel(tick)
+            return
+        }
+
+        // Следующее обновление — ровно в полночь, чтобы виджет показал новый день.
+        val today = LocalDate.now()
+        val midnight = today.plusDays(1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        try {
+            if (SignalScheduler.exact(c)) {
+                alarms.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, midnight, tick)
+            } else {
+                alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, midnight, tick)
+            }
+        } catch (e: SecurityException) {
+            alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, midnight, tick)
+        }
+
+        val day = today.toEpochDay()
+        val header = Fmt.weekday(day).replaceFirstChar { it.titlecase() } + ", " + Fmt.dayTitle(day, day)
+
+        // Заголовок открывает экран дня (на сегодня).
+        val openDayIntent = Intent(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LAUNCHER)
+            .setComponent(ComponentName(c, MainActivity::class.java))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        val openDay = PendingIntent.getActivity(c, 0, openDayIntent, immutable)
+        val add = PendingIntent.getActivity(
+            c,
+            1,
+            WidgetEntryActivity.intent(c, WidgetEntryActivity.ACTION_ADD),
+            immutable,
+        )
+        // Шаблон для строк списка: номер дела и день подставляются из строки, поэтому он изменяемый.
+        val mutable = PendingIntent.FLAG_UPDATE_CURRENT or
+            (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+        val row = PendingIntent.getActivity(
+            c,
+            2,
+            WidgetEntryActivity.intent(c, WidgetEntryActivity.ACTION_ROW),
+            mutable,
+        )
+
+        for (id in ids) {
+            val views = RemoteViews(c.packageName, R.layout.widget)
+            views.setTextViewText(R.id.header, header)
+            val adapter = Intent(c, RowsService::class.java)
+                .setData(Uri.parse("planner-widget://local/list/$id"))
+            views.setRemoteAdapter(R.id.rows, adapter)
+            views.setEmptyView(R.id.rows, R.id.empty)
+            views.setOnClickPendingIntent(R.id.header, openDay)
+            views.setOnClickPendingIntent(R.id.add, add)
+            views.setPendingIntentTemplate(R.id.rows, row)
+            manager.updateAppWidget(id, views)
+        }
+        manager.notifyAppWidgetViewDataChanged(ids, R.id.rows)
+    }
 }
-class PlannerWidget:AppWidgetProvider(){override fun onReceive(c:Context,i:Intent){super.onReceive(c,i);if(WidgetUpdater.isTick(i))WidgetUpdater.requestUpdate(c)};override fun onUpdate(c:Context,m:AppWidgetManager,ids:IntArray){WidgetUpdater.requestUpdate(c)}; override fun onDisabled(c:Context){WidgetUpdater.requestUpdate(c)} }
-class RowsService:RemoteViewsService(){override fun onGetViewFactory(i:Intent):RemoteViewsFactory=Rows(applicationContext)}
-private class Rows(private val c:Context):RemoteViewsService.RemoteViewsFactory {
-    private var items:List<Occurrence> = emptyList();override fun onCreate(){};override fun onDestroy(){items=emptyList()};override fun onDataSetChanged(){val token=Binder.clearCallingIdentity();try {items=c.container.repository.snapshotBlocking().occurrencesOn(LocalDate.now().toEpochDay())}finally{Binder.restoreCallingIdentity(token)}}
-    override fun getCount()=items.size;override fun getViewAt(index:Int):RemoteViews?{val o=items.getOrNull(index)?:return null;val line=listOf(TimeText.label(o.task),o.task.title).filter{it.isNotEmpty()}.joinToString("  ");val text=SpannableString(line);if(o.done)text.setSpan(StrikethroughSpan(),0,line.length,Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);return RemoteViews(c.packageName,R.layout.widget_row).apply{setTextViewText(R.id.row_text,text);setOnClickFillInIntent(R.id.row_text,Intent().putExtra("id",o.task.id).putExtra("day",o.day))}}
-    override fun getLoadingView():RemoteViews?=null;override fun getViewTypeCount()=1;override fun getItemId(i:Int)=items.getOrNull(i)?.task?.id?:-1L;override fun hasStableIds()=true
+
+class PlannerWidget : AppWidgetProvider() {
+    override fun onReceive(context: Context, intent: Intent) {
+        super.onReceive(context, intent)
+        if (WidgetUpdater.isTick(intent)) WidgetUpdater.requestUpdate(context)
+    }
+
+    override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
+        WidgetUpdater.requestUpdate(context)
+    }
+
+    override fun onEnabled(context: Context) {
+        WidgetUpdater.requestUpdate(context)
+    }
+
+    override fun onDisabled(context: Context) {
+        WidgetUpdater.requestUpdate(context)
+    }
 }
-class WidgetEntryActivity:ComponentActivity(){override fun onCreate(savedInstanceState:Bundle?){super.onCreate(savedInstanceState);val id=intent.getLongExtra("id",0);val day=intent.getLongExtra("day",LocalDate.now().toEpochDay());if(intent.action=="today"||(intent.action=="row"&&id<=0)){startActivity(Intent(this,MainActivity::class.java));finish();return};enableEdgeToEdge();setContent {val style by container.settings.style.collectAsStateWithLifecycle();var editor by rememberSaveable{mutableStateOf(intent.action=="add")};val close:()->Unit={if(id==0L||!editor)finish() else editor=false};PlannerTheme(style){EffectsHost(style){if(editor)EditorScreen(id,day,close) else TaskScreen(id,day,{finish()},{finish()},{editor=true})}};BackHandler(onBack=close) }}}
+
+class RowsService : RemoteViewsService() {
+    override fun onGetViewFactory(intent: Intent): RemoteViewsFactory = Rows(applicationContext)
+}
+
+/** Строки списка виджета: дела на сегодня в том же порядке, что и на экране дня. */
+private class Rows(private val c: Context) : RemoteViewsService.RemoteViewsFactory {
+    private var items: List<Occurrence> = emptyList()
+
+    override fun onCreate() {}
+
+    override fun onDestroy() {
+        items = emptyList()
+    }
+
+    override fun onDataSetChanged() {
+        val token = Binder.clearCallingIdentity()
+        try {
+            items = c.container.repository.snapshotBlocking().occurrencesOn(LocalDate.now().toEpochDay())
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось прочитать дела для виджета", e)
+            items = emptyList()
+        } finally {
+            Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    override fun getCount(): Int = items.size
+
+    override fun getViewAt(position: Int): RemoteViews? {
+        val item = items.getOrNull(position) ?: return null
+        val time = TimeText.label(item.task)
+        val line = if (time.isEmpty()) item.task.title else time + "  " + item.task.title
+        val text = SpannableString(line)
+        if (item.done) {
+            text.setSpan(StrikethroughSpan(), 0, line.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        val views = RemoteViews(c.packageName, R.layout.widget_row)
+        views.setTextViewText(R.id.row_text, text)
+        val fillIn = Intent()
+            .putExtra(WidgetEntryActivity.EXTRA_ID, item.task.id)
+            .putExtra(WidgetEntryActivity.EXTRA_DAY, item.day)
+        views.setOnClickFillInIntent(R.id.row_text, fillIn)
+        return views
+    }
+
+    override fun getLoadingView(): RemoteViews? = null
+
+    override fun getViewTypeCount(): Int = 1
+
+    override fun getItemId(position: Int): Long = items.getOrNull(position)?.task?.id ?: -1L
+
+    override fun hasStableIds(): Boolean = true
+}
+
+/** Страница дела или добавление дела на сегодня, открытые из виджета или из уведомления. */
+class WidgetEntryActivity : ComponentActivity() {
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val adding = intent.action == ACTION_ADD
+        val taskId = if (adding) 0L else intent.getLongExtra(EXTRA_ID, 0L)
+        val day = intent.getLongExtra(EXTRA_DAY, LocalDate.now().toEpochDay())
+        if (!adding && taskId <= 0L) {
+            finish()
+            return
+        }
+        enableEdgeToEdge()
+        setContent {
+            val style by container.settings.style.collectAsStateWithLifecycle()
+            var editing by rememberSaveable { mutableStateOf(adding) }
+            PlannerTheme(style = style) {
+                EffectsHost(style = style) {
+                    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                        if (editing) {
+                            EditorScreen(
+                                taskId = taskId,
+                                day = day,
+                                onClose = { if (adding) finish() else editing = false },
+                            )
+                        } else {
+                            TaskScreen(
+                                taskId = taskId,
+                                day = day,
+                                onBack = { finish() },
+                                onGone = { finish() },
+                                onEdit = { editing = true },
+                            )
+                        }
+                    }
+                }
+            }
+            BackHandler(enabled = editing && !adding) { editing = false }
+        }
+    }
+
+    companion object {
+        const val ACTION_ADD = "ru.dayplanner.app.widget.ADD"
+        const val ACTION_ROW = "ru.dayplanner.app.widget.ROW"
+        const val EXTRA_ID = "id"
+        const val EXTRA_DAY = "day"
+
+        fun intent(c: Context, action: String): Intent =
+            Intent(c, WidgetEntryActivity::class.java)
+                .setAction(action)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+    }
+}

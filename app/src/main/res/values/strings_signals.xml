@@ -1,1 +1,17 @@
-<resources><string name="signal_permissions">Разрешения для сигналов</string><string name="need_notice">Разрешите уведомления, чтобы получать напоминания, когда планировщик закрыт.</string><string name="need_exact">Разрешите точные сигналы. Без этого Android может доставить напоминание позже.</string><string name="need_full">Разрешите полноэкранный будильник. Без этого появится обычное срочное уведомление.</string><string name="grant">Разрешить</string><string name="signals_ok">Все необходимые разрешения выданы</string><string name="system_notice">Открыть настройки уведомлений</string><string name="ring_stop">Выключить</string><string name="ring_channel">Будильник</string><string name="notice_channel">Напоминания о делах</string><string name="ring_service_channel">Звонящий будильник</string></resources>
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="signal_permissions">Разрешения для сигналов</string>
+    <string name="need_notice">Разрешите уведомления, чтобы получать напоминания, когда планировщик закрыт.</string>
+    <string name="need_exact">Разрешите точные сигналы. Без этого Android может доставить напоминание позже.</string>
+    <string name="need_full">Разрешите полноэкранный будильник. Без этого вместо окна на весь экран появится громкое уведомление с кнопкой «Выключить».</string>
+    <string name="grant">Разрешить</string>
+    <string name="signals_ok">Все необходимые разрешения выданы</string>
+    <string name="system_notice">Открыть настройки уведомлений</string>
+    <string name="ring_stop">Выключить</string>
+    <string name="ring_channel">Будильник (запасное уведомление)</string>
+    <string name="notice_channel">Напоминания о делах</string>
+    <string name="ring_service_channel">Звонящий будильник</string>
+    <string name="signal_use_alarm">Будильник на весь экран</string>
+    <string name="signal_now_start">Пора начинать · %1$s</string>
+    <string name="signal_now_end">Время вышло · %1$s</string>
+</resources>
