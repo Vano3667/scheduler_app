@@ -3,8 +3,13 @@ package ru.dayplanner.app.ui.editor
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import kotlinx.coroutines.launch
 import ru.dayplanner.app.AppContainer
 import ru.dayplanner.app.domain.EditScope
@@ -19,6 +24,7 @@ class EditorViewModel(
     private val container: AppContainer,
     private val taskId: Long,
     val day: Long,
+    private val handle: SavedStateHandle,
 ) : ViewModel() {
 
     var state by mutableStateOf(EditorState())
@@ -42,13 +48,26 @@ class EditorViewModel(
     val needsScopeQuestion: Boolean get() = original?.isRepeating == true
 
     init {
+        // Форма, сохранённая перед выгрузкой приложения из памяти (если была).
+        val restored: EditorState? = try {
+            handle.get<EditorState>(KEY_STATE)
+        } catch (e: Exception) {
+            null
+        }
+        if (restored != null) state = restored
+
         if (taskId <= 0) {
-            val start = if (day == LocalDate.now().toEpochDay()) {
-                minOf((LocalTime.now().hour + 1) * 60, 23 * 60)
-            } else {
-                9 * 60
+            if (restored == null) {
+                val start = if (day == LocalDate.now().toEpochDay()) {
+                    minOf((LocalTime.now().hour + 1) * 60, 23 * 60)
+                } else {
+                    9 * 60
+                }
+                state = EditorState(
+                    startMinutes = start,
+                    endMinutes = minOf(start + 60, EditorState.LAST_MINUTE),
+                )
             }
-            state = EditorState(startMinutes = start, endMinutes = minOf(start + 60, EditorState.LAST_MINUTE))
         } else {
             viewModelScope.launch {
                 val task = container.repository.getTask(taskId)
@@ -56,7 +75,9 @@ class EditorViewModel(
                     missing = true
                 } else {
                     original = task
-                    state = EditorState.from(task, container.repository.getPhotoNames(taskId))
+                    if (restored == null) {
+                        state = EditorState.from(task, container.repository.getPhotoNames(taskId))
+                    }
                 }
                 loaded = true
             }
@@ -76,6 +97,7 @@ class EditorViewModel(
             s = s.copy(weekdaysError = false)
         }
         state = s
+        handle[KEY_STATE] = s
     }
 
     /** Проверяет форму и подсвечивает ошибки. */
@@ -118,5 +140,14 @@ class EditorViewModel(
                 saving = false
             }
         }
+    }
+
+    companion object {
+        private const val KEY_STATE = "editor_state"
+
+        fun factory(container: AppContainer, taskId: Long, day: Long): ViewModelProvider.Factory =
+            viewModelFactory {
+                initializer { EditorViewModel(container, taskId, day, createSavedStateHandle()) }
+            }
     }
 }

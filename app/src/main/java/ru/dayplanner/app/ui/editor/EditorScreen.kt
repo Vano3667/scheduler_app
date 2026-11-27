@@ -43,8 +43,6 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.lifecycle.viewmodel.initializer
-import androidx.lifecycle.viewmodel.viewModelFactory
 import ru.dayplanner.app.R
 import ru.dayplanner.app.container
 import ru.dayplanner.app.domain.EditScope
@@ -61,9 +59,7 @@ import ru.dayplanner.app.ui.effects.pressBurst
 @Composable
 fun EditorScreen(taskId: Long, day: Long, onClose: () -> Unit) {
     val container = LocalContext.current.container
-    val vm: EditorViewModel = viewModel(
-        factory = viewModelFactory { initializer { EditorViewModel(container, taskId, day) } },
-    )
+    val vm: EditorViewModel = viewModel(factory = EditorViewModel.factory(container, taskId, day))
     val state = vm.state
     var askScope by remember { mutableStateOf(false) }
     var pickStart by remember { mutableStateOf(false) }
@@ -118,6 +114,8 @@ fun EditorScreen(taskId: Long, day: Long, onClose: () -> Unit) {
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            TemplatePickButton(state = state, onChange = vm::update)
 
             OutlinedTextField(
                 value = state.title,

@@ -4,8 +4,12 @@ import ru.dayplanner.app.domain.RepeatMode
 import ru.dayplanner.app.domain.SignalType
 import ru.dayplanner.app.domain.Task
 import ru.dayplanner.app.domain.TimeMode
+import java.io.Serializable
 
-/** Все поля формы дела. */
+/**
+ * Все поля формы дела. Serializable — чтобы форма переживала выгрузку приложения из памяти
+ * (например, пока открыта камера).
+ */
 data class EditorState(
     val title: String = "",
     val description: String = "",
@@ -22,7 +26,7 @@ data class EditorState(
     val titleError: Boolean = false,
     val timeError: Boolean = false,
     val weekdaysError: Boolean = false,
-) {
+) : Serializable {
     fun toTask(day: Long): Task = Task(
         title = title.trim(),
         description = description.trim(),
@@ -38,6 +42,7 @@ data class EditorState(
     )
 
     companion object {
+        private const val serialVersionUID = 1L
         const val LAST_MINUTE = 23 * 60 + 59
 
         fun from(task: Task, photos: List<String>): EditorState {
@@ -53,7 +58,7 @@ data class EditorState(
                 timeMode = task.timeMode,
                 startMinutes = start,
                 endMinutes = end,
-                photos = photos,
+                photos = ArrayList(photos),
                 signalStart = task.signalStart,
                 signalEnd = task.signalEnd,
                 signalType = task.signalType,
